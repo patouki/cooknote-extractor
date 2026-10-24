@@ -1,0 +1,15 @@
+# Deploy via Render Blueprint: https://dashboard.render.com/blueprints
+services:
+  - type: web
+    name: cooknote-v42
+    runtime: docker
+    plan: standard # 2 Go de RAM minimum conseillés pour la transcription/OCR
+    healthCheckPath: /ready
+    autoDeployTrigger: commit
+    envVars:
+      - key: COOKNOTE_ENV
+        value: production
+      - key: COOKNOTE_WHISPER_MODEL
+        value: tiny
+      - key: COOKNOTE_SITE_PASSWORD
+        sync: false # demandé au déploiement : 12 caractères minimum

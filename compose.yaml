@@ -1,0 +1,14 @@
+services:
+  cooknote:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - PORT=8000
+    ports:
+      - "127.0.0.1:8000:8000" # pour un VPS, ajouter un reverse-proxy HTTPS (Caddy, Traefik, Nginx)
+    volumes:
+      - models:/var/cache/cooknote
+    mem_limit: 3g
+volumes:
+  models:
