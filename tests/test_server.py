@@ -39,7 +39,7 @@ def test_landing_health(client):
     assert '/server-bridge.js' in home.text
     assert client.get('/server-bridge.js').status_code == 200
     assert client.get('/ready').status_code == 200
-    assert client.get('/api/health').json()['version'] == '4.2'
+    assert client.get('/api/health').json()['version'] == '4.3'
     # Ensure backend source code is not served to the browser.
     assert client.get('/extractor.py').status_code == 404
     assert client.get('/.env').status_code == 404

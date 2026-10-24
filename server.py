@@ -7,6 +7,9 @@ both the UI and the computationally expensive extraction endpoints.
 from __future__ import annotations
 
 import asyncio
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import io
 import os
 import re
@@ -29,12 +32,17 @@ from multimodal import binaries, extract_video_url, ocr_image, process_media_fil
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / 'web'
-API_VERSION = '4.2'
+API_VERSION = '4.3'
 LIMITS = {'uploadBytes': MAX_MEDIA, 'imageBytes': 8_000_000, 'maxMinutes': 12}
 app = FastAPI(title='Cooknote V4.2', version=API_VERSION, docs_url=None, redoc_url=None, openapi_url=None)
 # Process-local controls. For hosted deployments run exactly one worker/instance.
 _gate = threading.BoundedSemaphore(value=1)
 _rate_lock = threading.Lock()
+_jobs_lock = threading.RLock()
+_jobs: dict[str, dict] = {}
+_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='cooknote-job')
+_MAX_QUEUED = 5
+_JOB_TTL_SECONDS = 2 * 3600
 _hits: dict[str, deque] = defaultdict(deque)
 _RATE_WINDOW = 3600
 _RATE_LIMIT = 24
@@ -116,11 +124,8 @@ async def security(request: Request, call_next):
 
 @contextmanager
 def processing_slot():
-    # Allow overlapping mobile/browser requests to queue briefly instead of
-    # immediately failing with HTTP 503. Still only one expensive OCR/Whisper
-    # process runs at any moment on a memory-constrained instance.
-    if not _gate.acquire(timeout=25):
-        raise HTTPException(503, detail='Le moteur est occupé depuis plus de 25 secondes. Réessayez bientôt.',
+    if not _gate.acquire(timeout=60):
+        raise HTTPException(503, detail='Moteur occupé : attente prolongée, réessayez bientôt.',
                             headers={'Retry-After':'20'})
     try:
         yield
@@ -171,9 +176,124 @@ def ready():
 @app.get('/api/health')
 def health():
     caps = binaries()
+    from browser_capture import browser_available
+    caps['browserCapture'] = browser_available()
     return {'ok': True, 'version': API_VERSION, 'capabilities': caps,
             'social': caps['ytdlp'], 'audio': caps['whisper'], 'ocr': caps['tesseract'],
             'video': caps['pyav'] or (caps['ffmpeg'] and caps['ffprobe']), 'limits': LIMITS}
+
+
+# Jobs avoid 90-second browser/proxy timeouts and allow the phone to reload.
+# These are intentionally private (the existing HTTP Basic middleware applies).
+# A production multi-instance deployment should use a persistent queue/Redis.
+def _job_public(job: dict):
+    return {k: v for k, v in job.items() if k in
+            ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error')}
+
+
+def _job_update(job_id: str, state=None, phase=None, percent=None, message=None, **extra):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        if state is not None: job['state'] = state
+        if phase is not None: job['phase'] = phase
+        if percent is not None: job['percent'] = min(100, max(0, int(percent)))
+        if message is not None: job['message'] = str(message)[:300]
+        job['updatedAt'] = datetime.now(timezone.utc).isoformat()
+        job.update(extra)
+
+
+def _job_work(job_id: str, url: str):
+    _job_update(job_id, 'running', 'metadata', 5, 'Lecture des métadonnées et de la légende…')
+    try:
+        # Serialise the expensive media processing even if legacy /api/extract is used.
+        with processing_slot():
+            import browser_capture
+            is_video = is_social(url)
+            output = None
+            first_error = None
+            try:
+                output = extract_checked(url)
+            except ExtractionError as exc:
+                first_error = exc
+            except Exception:
+                first_error = ExtractionError('Source indisponible pour le téléchargeur.', 'acces_refuse')
+            if output and output.get('status') == 'complete':
+                result = output
+            elif is_video and browser_capture.browser_available():
+                def progress(phase, pct, text):
+                    _job_update(job_id, 'running', phase, pct, text)
+                try:
+                    result = browser_capture.capture_public_video(url, progress=progress)
+                    if output and output.get('status') != 'none' and result.get('status') == 'none':
+                        result = output
+                        result.setdefault('warnings', []).append('Lecture navigateur : aucun ingrédient supplémentaire détecté.')
+                except ExtractionError as exc:
+                    if output:
+                        result = output
+                        result.setdefault('warnings', []).append(str(exc))
+                    else:
+                        raise
+            elif output:
+                result = output
+                if is_video:
+                    result.setdefault('warnings', []).append(
+                        'Capture navigateur non activée sur cette instance. Le moteur ne peut lire que les médias accessibles à yt-dlp.')
+            elif first_error:
+                raise first_error
+            else:
+                raise ExtractionError('Aucune recette détectée.', 'source_indisponible')
+        _job_update(job_id, 'completed', 'finished', 100, 'Analyse terminée.', result=result)
+    except ExtractionError as exc:
+        _job_update(job_id, 'failed', 'failed', 100, str(exc), error={'code': exc.code, 'message': str(exc)})
+    except HTTPException as exc:
+        _job_update(job_id, 'failed', 'failed', 100, str(exc.detail), error={'code': str(exc.status_code), 'message': str(exc.detail)})
+    except Exception:
+        _job_update(job_id, 'failed', 'failed', 100, 'Le moteur a échoué. Réessayez ou importez la vidéo.',
+                    error={'code': 'internal', 'message': 'Le moteur vidéo ne peut pas traiter ce média.'})
+
+
+@app.post('/api/jobs', status_code=202)
+def start_job(req: ExtractRequest):
+    try:
+        validate_public_url(req.url)
+    except ExtractionError as exc:
+        raise HTTPException(422, detail={'code':exc.code,'message':str(exc)}) from exc
+    if is_social(req.url) and not supported_video_url(req.url):
+        raise HTTPException(422, detail='Lien social non pris en charge : utilisez un Reel ou une vidéo publique.')
+    now = datetime.now(timezone.utc).isoformat()
+    with _jobs_lock:
+        # Jobs expire after two hours, but never prune a running job.
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=_JOB_TTL_SECONDS)
+        for key, job in list(_jobs.items()):
+            if job['state'] in ('completed', 'failed'):
+                try: expired = datetime.fromisoformat(job['updatedAt']) < cutoff
+                except ValueError: expired = True
+                if expired: del _jobs[key]
+        active = sum(j['state'] in ('queued', 'running') for j in _jobs.values())
+        if active >= _MAX_QUEUED:
+            raise HTTPException(503, detail='La file de capture est pleine : réessayez plus tard.',
+                                headers={'Retry-After': '30'})
+        job_id = uuid.uuid4().hex
+        job = {'jobId': job_id, 'state': 'queued', 'phase': 'queued', 'percent': 0,
+               'message': 'Extraction en cours : en attente du navigateur virtuel…',
+               'createdAt': now, 'updatedAt': now, 'result': None, 'error': None}
+        _jobs[job_id] = job
+        _job_executor.submit(_job_work, job_id, req.url)
+        return {**_job_public(job), 'pollAfterMs': 2500}
+
+
+@app.get('/api/jobs/{job_id}')
+def job_status(job_id: str):
+    if not re.fullmatch(r'[0-9a-f]{32}', job_id):
+        raise HTTPException(404, detail='Analyse introuvable.')
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, detail='Analyse expirée ou serveur redémarré. Relancez le lien.')
+        return {**_job_public(job), 'pollAfterMs': 3000}
 
 
 @app.post('/api/extract')

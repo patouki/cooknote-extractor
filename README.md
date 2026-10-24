@@ -80,3 +80,47 @@ Le test du navigateur utilise Chromium installé localement et simule la répons
 - `Dockerfile`, `render.yaml`, `compose.yaml` : création du serveur en ligne.
 - `examples/` : mini-vidéo et photo de recette pour essais.
 - `tests/` : tests unitaires et scénario utilisateur mobile.
+
+## Version 4.3 — navigateur virtuel, capture vidéo et tâches asynchrones
+
+La V4.3 crée une tâche via `POST /api/jobs` avec le corps `{"url":"https://..."}`.
+La réponse (HTTP 202) contient `jobId`, `state` et `percent` immédiatement.
+`GET /api/jobs/{jobId}` permet de suivre `queued`, `running`, `completed` ou `failed`, avec
+les phases `metadata`, `opening`, `watching`, `audio`, `ocr`. Le résultat structuré
+est renvoyé dans `result`. Le téléphone peut fermer/recharger l'onglet : la tâche
+continue tant que l'instance Render reste active, jusqu'à deux heures de rétention
+après achèvement. Le redémarrage d'un serveur efface la file en mémoire : pour une
+production à plusieurs instances, remplacer le stockage par Redis/Postgres et un
+worker indépendant.
+
+**Par défaut**, le Dockerfile standard conserve l'ancien moteur yt-dlp/Whisper et
+fournit la file asynchrone sans Chromium ; le navigateur virtuel n'est pas activé.
+
+**Mode navigateur** : construire `Dockerfile.browser` (Chromium + Playwright +
+PulseAudio null sink + FFmpeg) avec `COOKNOTE_BROWSER_CAPTURE=1`. Ce mode ouvre
+la publication *publique*, déclenche la lecture si possible, vérifie que la
+propriété `currentTime` du lecteur `<video>` avance, enregistre temporairement la
+vidéo de l'onglet, capture une sélection d'images, et enregistre la sortie audio
+locale du navigateur lorsque PulseAudio fonctionne. Il lance ensuite Whisper et
+l'OCR, fusionne les preuves réellement lues, et efface les médias temporaires.
+
+Ne pas promettre de contourner les pages nécessitant un compte, DRM, CAPTCHAs,
+restrictions régionales ni les plateformes qui bloquent l'automatisation. Un
+fichier vidéo obtenu légalement peut toujours être importé depuis le téléphone.
+
+### Capacités et taille du serveur
+
+Le couple Chromium + FFmpeg + Whisper est lourd et **n'est pas garanti sur un
+service Render Free (512 Mo)**. Déployer de préférence le navigateur virtuel sur
+un *worker isolé* ou une instance disposant de suffisamment de mémoire. Ne pas
+basculer le service principal sur ce Dockerfile sans contrôler les logs et
+les coûts. L'API `/api/health` (authentifiée) indique `capabilities.browserCapture`.
+
+### Adaptateur Base44
+
+La fonction `extract-recipe` accepte les actions `job-start` et `job-status`, proxy
+sécurisé vers l'API Render par HTTPS. Conserver `COOKNOTE_EXTRACTOR_PASSWORD`
+comme secret backend ou l'introduire temporairement dans Cooknote (mot de passe
+Render dans `sessionStorage` du navigateur, jamais GitHub). La variable secrète
+facultative `COOKNOTE_BROWSER_URL` permet de pointer vers un worker Chromium
+séparé du serveur standard.

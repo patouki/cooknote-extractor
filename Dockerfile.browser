@@ -1,0 +1,23 @@
+# Browser-enabled worker. May exceed the memory of Render's free tier.
+FROM python:3.11-slim-bookworm
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium ffmpeg pulseaudio pulseaudio-utils \
+    tesseract-ocr tesseract-ocr-fra tesseract-ocr-eng libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt browser-requirements.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt -r browser-requirements.txt
+RUN python -m playwright install ffmpeg
+COPY server.py extractor.py multimodal.py browser_capture.py ./
+COPY web/ ./web/
+RUN useradd --create-home --uid 10001 cooknote && mkdir -p /var/cache/cooknote /tmp/cooknote-runtime \
+    && chown -R cooknote:cooknote /var/cache/cooknote /tmp/cooknote-runtime /app
+USER cooknote
+ENV COOKNOTE_WHISPER_MODEL=tiny COOKNOTE_MODEL_DIR=/var/cache/cooknote/models \
+    COOKNOTE_BROWSER_CAPTURE=1 COOKNOTE_CHROMIUM_PATH=/usr/bin/chromium \
+    COOKNOTE_PULSE_MONITOR=cooknote.monitor XDG_RUNTIME_DIR=/tmp/cooknote-runtime \
+    PORT=8000
+EXPOSE 8000
+# Isolated null audio output sink: Chrome plays here and FFmpeg records its monitor.
+CMD ["sh", "-c", "pulseaudio -D --exit-idle-time=-1 --disallow-exit --log-target=stderr 2>/tmp/pulse.log || true; pactl load-module module-null-sink sink_name=cooknote sink_properties=device.description=Cooknote >/dev/null 2>&1 || true; pactl set-default-sink cooknote >/dev/null 2>&1 || true; exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers"]
