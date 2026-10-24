@@ -37,7 +37,7 @@ _gate = threading.BoundedSemaphore(value=1)
 _rate_lock = threading.Lock()
 _hits: dict[str, deque] = defaultdict(deque)
 _RATE_WINDOW = 3600
-_RATE_LIMIT = 12
+_RATE_LIMIT = 24
 
 
 def _require_secure_config():
@@ -102,7 +102,7 @@ async def security(request: Request, call_next):
                 while q and now - q[0] > _RATE_WINDOW:
                     q.popleft()
                 if len(q) >= _RATE_LIMIT:
-                    return JSONResponse({'detail':'Limite de 12 analyses par heure atteinte.'}, status_code=429,
+                    return JSONResponse({'detail':'Limite de 24 analyses par heure atteinte.'}, status_code=429,
                                         headers={'Retry-After':'3600'})
                 q.append(now)
     resp = await call_next(request)
@@ -116,9 +116,12 @@ async def security(request: Request, call_next):
 
 @contextmanager
 def processing_slot():
-    if not _gate.acquire(blocking=False):
-        raise HTTPException(503, detail='Une extraction est déjà en cours. Réessayez dans quelques instants.',
-                            headers={'Retry-After':'30'})
+    # Allow overlapping mobile/browser requests to queue briefly instead of
+    # immediately failing with HTTP 503. Still only one expensive OCR/Whisper
+    # process runs at any moment on a memory-constrained instance.
+    if not _gate.acquire(timeout=25):
+        raise HTTPException(503, detail='Le moteur est occupé depuis plus de 25 secondes. Réessayez bientôt.',
+                            headers={'Retry-After':'20'})
     try:
         yield
     finally:
