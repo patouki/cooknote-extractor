@@ -40,8 +40,10 @@ _gate = threading.BoundedSemaphore(value=1)
 _rate_lock = threading.Lock()
 _jobs_lock = threading.RLock()
 _jobs: dict[str, dict] = {}
+_job_futures = {}
 _job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='cooknote-job')
-_MAX_QUEUED = 5
+# A single 512 MB Render instance cannot safely queue multiple video/Whisper jobs.
+_MAX_QUEUED = 1
 _JOB_TTL_SECONDS = 2 * 3600
 _hits: dict[str, deque] = defaultdict(deque)
 _RATE_WINDOW = 3600
@@ -188,13 +190,13 @@ def health():
 # A production multi-instance deployment should use a persistent queue/Redis.
 def _job_public(job: dict):
     return {k: v for k, v in job.items() if k in
-            ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error')}
+            ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error', 'queuePosition')}
 
 
 def _job_update(job_id: str, state=None, phase=None, percent=None, message=None, **extra):
     with _jobs_lock:
         job = _jobs.get(job_id)
-        if job is None:
+        if job is None or job.get('state') == 'cancelled':
             return
         if state is not None: job['state'] = state
         if phase is not None: job['phase'] = phase
@@ -264,24 +266,31 @@ def start_job(req: ExtractRequest):
         raise HTTPException(422, detail='Lien social non pris en charge : utilisez un Reel ou une vidéo publique.')
     now = datetime.now(timezone.utc).isoformat()
     with _jobs_lock:
-        # Jobs expire after two hours, but never prune a running job.
         from datetime import timedelta
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=_JOB_TTL_SECONDS)
         for key, job in list(_jobs.items()):
-            if job['state'] in ('completed', 'failed'):
+            if job['state'] in ('completed', 'failed', 'cancelled'):
                 try: expired = datetime.fromisoformat(job['updatedAt']) < cutoff
                 except ValueError: expired = True
-                if expired: del _jobs[key]
-        active = sum(j['state'] in ('queued', 'running') for j in _jobs.values())
-        if active >= _MAX_QUEUED:
-            raise HTTPException(503, detail='La file de capture est pleine : réessayez plus tard.',
-                                headers={'Retry-After': '30'})
+                if expired:
+                    del _jobs[key]
+                    _job_futures.pop(key, None)
+        # Idempotency: reopening or re-submitting the same Reel resumes the existing job.
+        for job in _jobs.values():
+            if job.get('url') == req.url and job['state'] in ('queued', 'running'):
+                return {**_job_public(job), 'pollAfterMs': 3000, 'reused': True}
+        # Do not accept more work while an already cancelled worker still uses CPU.
+        running = any(not f.done() for f in _job_futures.values())
+        if running:
+            raise HTTPException(503,
+                detail='Le moteur vidéo est déjà occupé. Une seule vidéo peut être analysée à la fois sur le serveur gratuit. Revenez dans quelques minutes ou importez le fichier vidéo.',
+                headers={'Retry-After': '60'})
         job_id = uuid.uuid4().hex
-        job = {'jobId': job_id, 'state': 'queued', 'phase': 'queued', 'percent': 0,
-               'message': 'Extraction en cours : en attente du navigateur virtuel…',
+        job = {'jobId': job_id, 'url': req.url, 'state': 'queued', 'phase': 'queued', 'percent': 0,
+               'message': 'Démarrage du moteur vidéo…', 'queuePosition': 1,
                'createdAt': now, 'updatedAt': now, 'result': None, 'error': None}
         _jobs[job_id] = job
-        _job_executor.submit(_job_work, job_id, req.url)
+        _job_futures[job_id] = _job_executor.submit(_job_work, job_id, req.url)
         return {**_job_public(job), 'pollAfterMs': 2500}
 
 
@@ -293,6 +302,34 @@ def job_status(job_id: str):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, detail='Analyse expirée ou serveur redémarré. Relancez le lien.')
+        response={**_job_public(job), 'pollAfterMs': 3000}
+        try:
+            age=(datetime.now(timezone.utc)-datetime.fromisoformat(job['updatedAt'])).total_seconds()
+        except (ValueError, TypeError):
+            age=0
+        if job['state']=='running' and age>90:
+            response['slow']=True
+            response['message']=(job.get('message') or 'Analyse en cours') + ' · Étape longue sur le serveur gratuit. Vous pouvez fermer cet écran et revenir plus tard.'
+        return response
+
+
+@app.post('/api/jobs/{job_id}/cancel')
+def cancel_job(job_id: str):
+    if not re.fullmatch(r'[0-9a-f]{32}', job_id):
+        raise HTTPException(404, detail='Analyse introuvable.')
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, detail='Analyse introuvable ou expirée.')
+        if job['state'] in ('completed', 'failed', 'cancelled'):
+            return {**_job_public(job), 'pollAfterMs': 3000}
+        future=_job_futures.get(job_id)
+        stopped=bool(future and future.cancel())
+        job['state']='cancelled'
+        job['phase']='cancelled'
+        job['message']=('Extraction annulée avant son démarrage.' if stopped else
+                        'Suivi annulé. Le traitement déjà commencé peut encore occuper le serveur.')
+        job['updatedAt']=datetime.now(timezone.utc).isoformat()
         return {**_job_public(job), 'pollAfterMs': 3000}
 
 
