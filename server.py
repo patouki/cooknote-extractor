@@ -14,6 +14,9 @@ import io
 import os
 import re
 import secrets
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -40,11 +43,15 @@ _gate = threading.BoundedSemaphore(value=1)
 _rate_lock = threading.Lock()
 _jobs_lock = threading.RLock()
 _jobs: dict[str, dict] = {}
-_job_futures = {}
 _job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='cooknote-job')
-# A single 512 MB Render instance cannot safely queue multiple video/Whisper jobs.
-_MAX_QUEUED = 1
+_MAX_QUEUED = 3
 _JOB_TTL_SECONDS = 2 * 3600
+# A free Render instance can run only one expensive video job at a time.
+# Bound waiting and execution to prevent indefinite '0%' and wedged queues.
+_MAX_QUEUE_WAIT = min(1800, max(20, int(os.getenv('COOKNOTE_MAX_QUEUE_WAIT', '105'))))
+_MAX_JOB_RUNTIME = min(1200, max(60, int(os.getenv('COOKNOTE_MAX_JOB_RUNTIME', '420'))))
+_JOB_PREFIX = 'COOKNOTE_JOB_JSON:'
+_job_processes: dict[str, subprocess.Popen] = {}
 _hits: dict[str, deque] = defaultdict(deque)
 _RATE_WINDOW = 3600
 _RATE_LIMIT = 24
@@ -126,7 +133,7 @@ async def security(request: Request, call_next):
 
 @contextmanager
 def processing_slot():
-    if not _gate.acquire(timeout=60):
+    if not _gate.acquire(timeout=8):
         raise HTTPException(503, detail='Moteur occupé : attente prolongée, réessayez bientôt.',
                             headers={'Retry-After':'20'})
     try:
@@ -188,15 +195,134 @@ def health():
 # Jobs avoid 90-second browser/proxy timeouts and allow the phone to reload.
 # These are intentionally private (the existing HTTP Basic middleware applies).
 # A production multi-instance deployment should use a persistent queue/Redis.
+def _queued_info_locked(job: dict):
+    waiting = sorted((j for j in _jobs.values() if j['state'] == 'queued'),
+                     key=lambda j: j['createdAt'])
+    position = next((i + 1 for i, j in enumerate(waiting) if j['jobId'] == job['jobId']), 0)
+    return position
+
+
+def _expire_queued_locked(job: dict):
+    if job['state'] != 'queued':
+        return
+    try:
+        waited = (datetime.now(timezone.utc) - datetime.fromisoformat(job['createdAt'])).total_seconds()
+    except ValueError:
+        waited = 0
+    if waited >= _MAX_QUEUE_WAIT:
+        job.update(state='failed', phase='failed', percent=100,
+                   message='Le serveur est occupé : la tâche a trop attendu dans la file.',
+                   updatedAt=datetime.now(timezone.utc).isoformat(),
+                   error={'code':'queue_timeout',
+                          'message':'File d’attente saturée. Relancez lorsque le serveur sera disponible.'})
+
+
 def _job_public(job: dict):
-    return {k: v for k, v in job.items() if k in
-            ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error', 'queuePosition')}
+    with _jobs_lock:
+        _expire_queued_locked(job)
+        data = {k: v for k, v in job.items() if k in
+                ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error')}
+        if job['state'] == 'queued':
+            position = _queued_info_locked(job)
+            data['queuePosition'] = position
+            data['message'] = ('Un traitement est déjà en cours : votre recette est en file d’attente '
+                               f'(position {position}).')
+            data['queueWaitLimitSeconds'] = _MAX_QUEUE_WAIT
+        return data
+
+
+def _terminate_worker(proc: subprocess.Popen):
+    # Kill the entire process group even if Python exited first; Chromium and
+    # FFmpeg can otherwise remain alive and consume the free instance's RAM.
+    try:
+        import os as _os
+        _os.killpg(proc.pid, signal.SIGTERM)
+        if proc.poll() is None:
+            proc.wait(timeout=3)
+    except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+        try:
+            import os as _os
+            _os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _isolated_job_work(job_id: str, url: str):
+    # A separate process ensures that a stalled Chromium/Whisper import can be
+    # killed; unlike ThreadPoolExecutor itself, this is forcibly cancellable.
+    _job_update(job_id, 'running', 'metadata', 5, 'Lecture des informations publiques…')
+    proc = None
+    result_holder = {'result': None, 'error': None}
+    try:
+        with processing_slot():
+            with _jobs_lock:
+                if _jobs.get(job_id, {}).get('state') == 'cancelled':
+                    return
+            proc = subprocess.Popen([sys.executable, '-u', str(ROOT / 'job_worker.py'), url],
+                                    cwd=str(ROOT), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, bufsize=1, start_new_session=True)
+            with _jobs_lock:
+                _job_processes[job_id] = proc
+            def consume_events():
+                if not proc.stdout:
+                    return
+                for line in proc.stdout:
+                    if not line.startswith(_JOB_PREFIX):
+                        continue
+                    try:
+                        import json
+                        event = json.loads(line[len(_JOB_PREFIX):])
+                    except (ValueError, TypeError):
+                        continue
+                    if event.get('type') == 'progress':
+                        _job_update(job_id, 'running', event.get('phase', 'metadata'),
+                                    event.get('percent', 8), event.get('message', 'Traitement en cours…'))
+                    elif event.get('type') == 'result':
+                        result_holder['result'] = event.get('result')
+                    elif event.get('type') == 'error':
+                        result_holder['error'] = event
+            reader = threading.Thread(target=consume_events, daemon=True, name='cooknote-job-events')
+            reader.start()
+            deadline = time.monotonic() + _MAX_JOB_RUNTIME
+            while proc.poll() is None:
+                with _jobs_lock:
+                    cancelled = _jobs.get(job_id, {}).get('state') == 'cancelled'
+                if cancelled:
+                    _terminate_worker(proc)
+                    return
+                if time.monotonic() >= deadline:
+                    _terminate_worker(proc)
+                    _job_update(job_id, 'failed', 'failed', 100,
+                                'Délai maximal atteint : la vidéo nécessite trop de temps sur ce serveur.',
+                                error={'code':'job_timeout',
+                                       'message':'Analyse interrompue après la durée maximale. Essayez une vidéo plus courte ou un fichier local.'})
+                    return
+                time.sleep(.3)
+            reader.join(timeout=3)
+        if result_holder['result'] is not None:
+            _job_update(job_id, 'completed', 'finished', 100, 'Recette analysée.',
+                        result=result_holder['result'])
+        else:
+            err = result_holder['error'] or {'code': 'worker_failed',
+                 'message': 'Le moteur a été interrompu. Réessayez ou importez le fichier vidéo.'}
+            _job_update(job_id, 'failed', 'failed', 100, str(err['message']),
+                        error={'code':str(err.get('code') or 'worker_failed'), 'message':str(err['message'])})
+    except Exception:
+        _job_update(job_id, 'failed', 'failed', 100,
+                    'Impossible de lancer le moteur vidéo. Réessayez.',
+                    error={'code':'startup', 'message':'Le moteur vidéo ne démarre pas sur cette instance.'})
+    finally:
+        if proc:
+            _terminate_worker(proc)
+        with _jobs_lock:
+            _job_processes.pop(job_id, None)
 
 
 def _job_update(job_id: str, state=None, phase=None, percent=None, message=None, **extra):
     with _jobs_lock:
         job = _jobs.get(job_id)
-        if job is None or job.get('state') == 'cancelled':
+        if job is None or job['state'] in ('cancelled', 'completed', 'failed'):
             return
         if state is not None: job['state'] = state
         if phase is not None: job['phase'] = phase
@@ -207,6 +333,15 @@ def _job_update(job_id: str, state=None, phase=None, percent=None, message=None,
 
 
 def _job_work(job_id: str, url: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or job['state'] != 'queued':
+            return
+        _expire_queued_locked(job)
+        if job['state'] != 'queued':
+            return
+    if os.getenv('COOKNOTE_ENV') == 'production' and os.getenv('COOKNOTE_JOB_ISOLATION', '1') != '0':
+        return _isolated_job_work(job_id, url)
     _job_update(job_id, 'running', 'metadata', 5, 'Lecture des métadonnées et de la légende…')
     try:
         # Serialise the expensive media processing even if legacy /api/extract is used.
@@ -266,51 +401,31 @@ def start_job(req: ExtractRequest):
         raise HTTPException(422, detail='Lien social non pris en charge : utilisez un Reel ou une vidéo publique.')
     now = datetime.now(timezone.utc).isoformat()
     with _jobs_lock:
+        # Jobs expire after two hours, but never prune a running job.
         from datetime import timedelta
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=_JOB_TTL_SECONDS)
         for key, job in list(_jobs.items()):
+            _expire_queued_locked(job)
             if job['state'] in ('completed', 'failed', 'cancelled'):
                 try: expired = datetime.fromisoformat(job['updatedAt']) < cutoff
                 except ValueError: expired = True
-                if expired:
-                    del _jobs[key]
-                    _job_futures.pop(key, None)
-        # Idempotency: reopening or re-submitting the same Reel resumes the existing job.
+                if expired: del _jobs[key]
+        # Repeated taps must not generate multiple expensive queued tasks.
         for job in _jobs.values():
-            if job.get('url') == req.url and job['state'] in ('queued', 'running'):
+            if job.get('_url') == req.url and job['state'] in ('queued', 'running'):
                 return {**_job_public(job), 'pollAfterMs': 3000, 'reused': True}
-        # Do not accept more work while an already cancelled worker still uses CPU.
-        running = any(not f.done() for f in _job_futures.values())
-        if running:
-            raise HTTPException(503,
-                detail='Le moteur vidéo est déjà occupé. Une seule vidéo peut être analysée à la fois sur le serveur gratuit. Revenez dans quelques minutes ou importez le fichier vidéo.',
-                headers={'Retry-After': '60'})
+        active = sum(j['state'] in ('queued', 'running') for j in _jobs.values())
+        if active >= _MAX_QUEUED:
+            raise HTTPException(503, detail='La file de capture est pleine : réessayez plus tard.',
+                                headers={'Retry-After': '30'})
         job_id = uuid.uuid4().hex
-        job = {'jobId': job_id, 'url': req.url, 'state': 'queued', 'phase': 'queued', 'percent': 0,
-               'message': 'Démarrage du moteur vidéo…', 'queuePosition': 1,
-               'createdAt': now, 'updatedAt': now, 'result': None, 'error': None}
+        job = {'jobId': job_id, 'state': 'queued', 'phase': 'queued', 'percent': 0,
+               'message': 'En file d’attente : extraction dès que le moteur est libre.',
+               'createdAt': now, 'updatedAt': now, 'result': None, 'error': None,
+               '_url': req.url}
         _jobs[job_id] = job
-        _job_futures[job_id] = _job_executor.submit(_job_work, job_id, req.url)
+        _job_executor.submit(_job_work, job_id, req.url)
         return {**_job_public(job), 'pollAfterMs': 2500}
-
-
-@app.get('/api/jobs/{job_id}')
-def job_status(job_id: str):
-    if not re.fullmatch(r'[0-9a-f]{32}', job_id):
-        raise HTTPException(404, detail='Analyse introuvable.')
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(404, detail='Analyse expirée ou serveur redémarré. Relancez le lien.')
-        response={**_job_public(job), 'pollAfterMs': 3000}
-        try:
-            age=(datetime.now(timezone.utc)-datetime.fromisoformat(job['updatedAt'])).total_seconds()
-        except (ValueError, TypeError):
-            age=0
-        if job['state']=='running' and age>90:
-            response['slow']=True
-            response['message']=(job.get('message') or 'Analyse en cours') + ' · Étape longue sur le serveur gratuit. Vous pouvez fermer cet écran et revenir plus tard.'
-        return response
 
 
 @app.post('/api/jobs/{job_id}/cancel')
@@ -321,15 +436,28 @@ def cancel_job(job_id: str):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, detail='Analyse introuvable ou expirée.')
-        if job['state'] in ('completed', 'failed', 'cancelled'):
-            return {**_job_public(job), 'pollAfterMs': 3000}
-        future=_job_futures.get(job_id)
-        stopped=bool(future and future.cancel())
-        job['state']='cancelled'
-        job['phase']='cancelled'
-        job['message']=('Extraction annulée avant son démarrage.' if stopped else
-                        'Suivi annulé. Le traitement déjà commencé peut encore occuper le serveur.')
-        job['updatedAt']=datetime.now(timezone.utc).isoformat()
+        if job['state'] in ('queued', 'running'):
+            job.update(state='cancelled', phase='cancelled', percent=100,
+                       message='Extraction annulée.', updatedAt=datetime.now(timezone.utc).isoformat(),
+                       error={'code':'cancelled','message':'Analyse annulée à votre demande.'})
+            proc = _job_processes.get(job_id)
+        else:
+            proc = None
+        response = _job_public(job)
+    # Stop the full worker process group without blocking the web request.
+    if proc:
+        threading.Thread(target=_terminate_worker, args=(proc,), daemon=True).start()
+    return response
+
+
+@app.get('/api/jobs/{job_id}')
+def job_status(job_id: str):
+    if not re.fullmatch(r'[0-9a-f]{32}', job_id):
+        raise HTTPException(404, detail='Analyse introuvable.')
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, detail='Analyse expirée ou serveur redémarré. Relancez le lien.')
         return {**_job_public(job), 'pollAfterMs': 3000}
 
 
