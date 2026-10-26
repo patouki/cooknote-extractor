@@ -318,7 +318,7 @@ def merge_evidence(title: str, platform: str, fragments: list[tuple[str, str]], 
 
 
 def process_media_file(path: Path, *, title='Recette vidéo', platform='Vidéo locale', url='',
-                       known_fragments=None, image='') -> dict:
+                       known_fragments=None, image='', progress=None) -> dict:
     if path.stat().st_size > MAX_MEDIA:
         raise ExtractionError('Fichier vidéo limité à 100 Mo.', 'limite')
     duration = media_duration(path)
@@ -326,18 +326,21 @@ def process_media_file(path: Path, *, title='Recette vidéo', platform='Vidéo l
     errors = []
     if not (shutil.which('tesseract') or _module_installed('rapidocr')):
         errors.append('OCR non disponible (RapidOCR ou Tesseract requis).')
+    if progress: progress('audio', 58, 'Transcription audio Whisper en cours (durée variable)…')
     try:
         transcript = audio_transcript(path)
         if transcript:
             sources.append(('audio Whisper', transcript))
     except ExtractionError as exc:
         errors.append(str(exc))
+    if progress: progress('ocr', 81, 'Analyse OCR des images de la vidéo…')
     try:
         overlay = frame_text(path, duration)
         if overlay:
             sources.append(('images OCR', overlay))
     except (OSError, ValueError):
         errors.append('Lecture des images indisponible.')
+    if progress: progress('ocr', 95, 'Fusion des ingrédients et des étapes…')
     result = merge_evidence(title, platform, sources, image=image, url=url)
     result['durationSeconds'] = round(duration)
     result['warnings'] = errors
@@ -346,13 +349,24 @@ def process_media_file(path: Path, *, title='Recette vidéo', platform='Vidéo l
     return result
 
 
-def _download_video(url: str, destination: Path):
+def _download_video(url: str, destination: Path, on_progress=None):
     import yt_dlp
     class TooLarge(Exception):
         pass
+    last_report=[0.0]
     def progress(data):
-        if (data.get('downloaded_bytes') or 0) > MAX_MEDIA:
+        n=data.get('downloaded_bytes') or 0
+        if n > MAX_MEDIA:
             raise TooLarge()
+        if not on_progress or data.get('status') not in ('downloading','finished'):
+            return
+        now=__import__('time').monotonic()
+        if now-last_report[0]<2 and data.get('status')!='finished':
+            return
+        last_report[0]=now
+        total=data.get('total_bytes') or data.get('total_bytes_estimate') or MAX_MEDIA
+        pct=30+int(22*min(1,n/max(1,total)))
+        on_progress('downloading',pct,'Téléchargement de la vidéo : '+str(round(n/1048576,1))+' Mo')
     opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True, 'skip_download': False,
             'format': 'best[height<=720][ext=mp4]/best[height<=720]/best',
             'outtmpl': str(destination / 'source.%(ext)s'),
@@ -375,10 +389,11 @@ def _download_video(url: str, destination: Path):
     return file
 
 
-def extract_video_url(url: str) -> dict:
+def extract_video_url(url: str, progress=None) -> dict:
     """Only called after public URL validation + known video platform classification."""
     import yt_dlp
     validate_public_url(url)
+    if progress: progress('metadata', 9, 'Récupération des informations publiques de la vidéo…')
     opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'noplaylist': True,
             'socket_timeout': 14, 'retries': 1, 'extractor_retries': 0,
             'ignoreerrors': False, 'cachedir': False, 'playlistend': 1}
@@ -391,6 +406,7 @@ def extract_video_url(url: str) -> dict:
         raise ExtractionError('Métadonnées vidéo absentes.', 'source_indisponible')
     if info.get('entries'):
         info = next((it for it in info['entries'] if isinstance(it, dict)), {})
+    if progress: progress('metadata', 18, 'Lecture de la légende et des sous-titres…')
     title = str(info.get('title') or 'Recette vidéo')[:120]
     platform = urlparse(url).hostname or 'Vidéo'
     caption = str(info.get('description') or info.get('caption') or '')[:MAX_TRANSCRIPT]
@@ -411,12 +427,13 @@ def extract_video_url(url: str) -> dict:
         first['warnings'] = ['FFmpeg et FFprobe manquants.']
         first['message'] += ' Installez FFmpeg pour analyser audio et images.'
         return first
+    if progress: progress('downloading', 28, 'Préparation du téléchargement de la vidéo…')
     with tempfile.TemporaryDirectory(prefix='cooknote-video-') as temp:
         try:
-            path = _download_video(url, Path(temp))
+            path = _download_video(url, Path(temp), on_progress=progress)
         except ExtractionError as exc:
             first['warnings'] = [str(exc)]
             first['message'] += ' ' + str(exc)
             return first
         return process_media_file(path, title=title, platform=platform,
-                                  url=url, known_fragments=fragments, image=first['recipe']['image'])
+                                  url=url, known_fragments=fragments, image=first['recipe']['image'], progress=progress)

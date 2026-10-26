@@ -158,13 +158,13 @@ def supported_video_url(url: str):
     return False
 
 
-def extract_checked(url: str):
+def extract_checked(url: str, progress=None):
     # Validate URL and ensure public resolution before any external requests.
     validate_public_url(url)
     if is_social(url):
         if not supported_video_url(url):
             raise ExtractionError('Lien vidéo non pris en charge : utilisez un Reel, un TikTok ou une vidéo YouTube.', 'url_invalide')
-        return extract_video_url(url)
+        return extract_video_url(url, progress=progress) if progress else extract_video_url(url)
     return extract_url(url)
 
 
@@ -214,7 +214,7 @@ def _job_work(job_id: str, url: str):
             output = None
             first_error = None
             try:
-                output = extract_checked(url)
+                output = extract_checked(url, progress=lambda phase, pct, msg: _job_update(job_id,'running',phase,pct,msg))
             except ExtractionError as exc:
                 first_error = exc
             except Exception:
