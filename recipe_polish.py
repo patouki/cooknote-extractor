@@ -78,6 +78,13 @@ def _title_candidate(value: str) -> str:
     value = re.sub(r'(?i)\s*(?:[|–-]\s*)?(?:instagram|tiktok|youtube)(?:\s+(?:reels?|video))?\s*$', '', value)
     value = re.sub(r'^[^:]{1,45}\bon\s+instagram\s*:\s*', '', value, flags=re.I)
     value = re.sub(r'\s+', ' ', value).strip(' \t\r\n"“”‘’✳🍴🥣👩‍🍳👨‍🍳—-:|•!,.;')
+    # Social metadata often prefixes the publisher before a colon, bar or dash.
+    for segment in re.split(r'\s+[|—–-]\s+|\s*:\s*', value):
+        if DISH_RE.search(segment) and not PROMO_RE.search(segment):
+            value = segment.strip()
+            break
+    if re.match(r'(?i)^(?:ajoutez?|m[eé]langez?|coupez?|versez?|cuisez?|assaisonnez?|salez|poivrez|pr[eé]chauffez|incorporez?|servez?|ensuite|puis)\b', value):
+        return ''
     if not value or len(value) < 5:
         return ''
     if PROMO_RE.search(value) or not DISH_RE.search(value):
