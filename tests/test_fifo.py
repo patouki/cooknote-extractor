@@ -47,12 +47,12 @@ def test_position_accounts_for_current_running_job(pending):
     server._job_update(ids[0],'running','audio',58,'Transcription Whisper')
     first=client.get('/api/jobs/'+ids[1]).json()
     last=client.get('/api/jobs/'+ids[3]).json()
-    assert first['queuePosition']==1
+    assert first['queuePosition']==2
     assert first['queueAhead']==1
-    assert last['queuePosition']==3
+    assert last['queuePosition']==4
     assert last['queueAhead']==3
     assert first['queueBusy']
-    assert first['queueLength']==3
+    assert first['queueLength']==4
 
 def test_cancelled_queue_item_releases_place(pending):
     client,submitted=pending

@@ -234,15 +234,16 @@ def _job_public(job: dict):
         data = {k: v for k, v in job.items() if k in
                 ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error')}
         running, waiting = _queue_totals_locked()
-        data['queueLength'] = waiting
+        data['queueLength'] = waiting + running
+        data['waitingCount'] = waiting
         data['queueBusy'] = bool(running)
         data['parallelJobs'] = 1
         if job['state'] == 'queued':
-            position = _queued_info_locked(job)
-            ahead = max(0, position - 1) + running
+            position = _queued_info_locked(job) + running
+            ahead = max(0, position - 1)
             data['queuePosition'] = position
             data['queueAhead'] = ahead
-            data['message'] = (f'Vous êtes {position}ᵉ dans la file. '
+            data['message'] = (f'Votre demande est n°{position} dans la file. '
                                f'{ahead} traitement(s) avant le vôtre. '
                                'Les recettes sont analysées une par une.')
             data['queueWaitLimitSeconds'] = _MAX_QUEUE_WAIT
