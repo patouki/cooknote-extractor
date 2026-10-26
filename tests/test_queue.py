@@ -42,7 +42,7 @@ def test_queue_position_and_expiry(monkeypatch):
         assert first['queuePosition'] == 1
         assert second['queuePosition'] == 2
         with server._jobs_lock:
-            server._jobs[second['jobId']]['createdAt'] = (datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+            server._jobs[second['jobId']]['createdAt'] = (datetime.now(timezone.utc)-timedelta(seconds=server._MAX_QUEUE_WAIT+10)).isoformat()
         expired = c.get('/api/jobs/'+second['jobId']).json()
         assert expired['state'] == 'failed'
         assert expired['error']['code'] == 'queue_timeout'

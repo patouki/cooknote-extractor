@@ -44,17 +44,22 @@ _rate_lock = threading.Lock()
 _jobs_lock = threading.RLock()
 _jobs: dict[str, dict] = {}
 _job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='cooknote-job')
-_MAX_QUEUED = 3
-_JOB_TTL_SECONDS = 2 * 3600
+# One bounded FIFO queue for all URL imports in this service, never parallel
+# Chromium/Whisper jobs. No additional paid workers are started.
+_MAX_QUEUED = min(40, max(2, int(os.getenv('COOKNOTE_QUEUE_CAPACITY', '20'))))
+_JOB_TTL_SECONDS = 6 * 3600
 # A free Render instance can run only one expensive video job at a time.
 # Bound waiting and execution to prevent indefinite '0%' and wedged queues.
-_MAX_QUEUE_WAIT = min(1800, max(20, int(os.getenv('COOKNOTE_MAX_QUEUE_WAIT', '105'))))
+# Queued jobs may wait behind several long videos without failing after 105 s.
+_MAX_QUEUE_WAIT = min(8 * 3600, max(300, int(os.getenv('COOKNOTE_MAX_QUEUE_WAIT', '14400'))))
 _MAX_JOB_RUNTIME = min(1200, max(60, int(os.getenv('COOKNOTE_MAX_JOB_RUNTIME', '420'))))
 _JOB_PREFIX = 'COOKNOTE_JOB_JSON:'
 _job_processes: dict[str, subprocess.Popen] = {}
 _hits: dict[str, deque] = defaultdict(deque)
 _RATE_WINDOW = 3600
-_RATE_LIMIT = 24
+# Queue capacity and single-worker execution protect CPU; per-IP limits are higher
+# because all Base44 visitors can share the same outbound proxy IP.
+_RATE_LIMIT = 120
 
 
 def _require_secure_config():
@@ -119,7 +124,7 @@ async def security(request: Request, call_next):
                 while q and now - q[0] > _RATE_WINDOW:
                     q.popleft()
                 if len(q) >= _RATE_LIMIT:
-                    return JSONResponse({'detail':'Limite de 24 analyses par heure atteinte.'}, status_code=429,
+                    return JSONResponse({'detail':'Limite de 120 demandes par heure atteinte.'}, status_code=429,
                                         headers={'Retry-After':'3600'})
                 q.append(now)
     resp = await call_next(request)
@@ -202,6 +207,12 @@ def _queued_info_locked(job: dict):
     return position
 
 
+def _queue_totals_locked():
+    running = sum(1 for item in _jobs.values() if item['state'] == 'running')
+    waiting = sum(1 for item in _jobs.values() if item['state'] == 'queued')
+    return running, waiting
+
+
 def _expire_queued_locked(job: dict):
     if job['state'] != 'queued':
         return
@@ -222,12 +233,22 @@ def _job_public(job: dict):
         _expire_queued_locked(job)
         data = {k: v for k, v in job.items() if k in
                 ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error')}
+        running, waiting = _queue_totals_locked()
+        data['queueLength'] = waiting
+        data['queueBusy'] = bool(running)
+        data['parallelJobs'] = 1
         if job['state'] == 'queued':
             position = _queued_info_locked(job)
+            ahead = max(0, position - 1) + running
             data['queuePosition'] = position
-            data['message'] = ('Un traitement est déjà en cours : votre recette est en file d’attente '
-                               f'(position {position}).')
+            data['queueAhead'] = ahead
+            data['message'] = (f'Vous êtes {position}ᵉ dans la file. '
+                               f'{ahead} traitement(s) avant le vôtre. '
+                               'Les recettes sont analysées une par une.')
             data['queueWaitLimitSeconds'] = _MAX_QUEUE_WAIT
+        elif job['state'] == 'running':
+            data['queuePosition'] = 0
+            data['queueAhead'] = 0
         return data
 
 
@@ -416,7 +437,7 @@ def start_job(req: ExtractRequest):
                 return {**_job_public(job), 'pollAfterMs': 3000, 'reused': True}
         active = sum(j['state'] in ('queued', 'running') for j in _jobs.values())
         if active >= _MAX_QUEUED:
-            raise HTTPException(503, detail='La file de capture est pleine : réessayez plus tard.',
+            raise HTTPException(503, detail=f'La file de traitement est pleine ({_MAX_QUEUED} demandes). Réessayez plus tard.',
                                 headers={'Retry-After': '30'})
         job_id = uuid.uuid4().hex
         job = {'jobId': job_id, 'state': 'queued', 'phase': 'queued', 'percent': 0,
