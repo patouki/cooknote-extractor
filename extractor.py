@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from recipe_polish import recipe_title, explicit_seasonings
 
 MAX_HTML = 3_000_000
 SOCIAL_DOMAINS = ('tiktok.com', 'instagram.com', 'youtube.com', 'youtu.be')
@@ -250,6 +251,12 @@ def completion(recipe: dict) -> str:
 
 
 def package(recipe: dict, method: str, url: str = '', note: str = '') -> dict:
+    # Also include seasonings explicitly mentioned in preparation instructions,
+    # even when absent from the source's separate ingredient list.
+    recipe['ingredients'] = explicit_seasonings(
+        recipe.get('ingredients') or [],
+        [recipe.get('description') or '', *(recipe.get('steps') or [])]
+    )
     status = completion(recipe)
     return {'status': status, 'method': method, 'recipe': recipe, 'sourceUrl': url,
             'message': note or ('Recette détectée. Vérifiez les quantités avant de la conserver.' if status == 'complete'
@@ -336,9 +343,12 @@ def extract_social(url: str) -> dict:
         info = next((e for e in info['entries'] if isinstance(e, dict)), {})
     platform = urlparse(url).hostname or 'réseau social'
     caption = info.get('description') or info.get('caption') or ''
-    title = info.get('title') or 'Publication de cuisine'
-    text = (title + '\n' + caption).strip()
-    recipe = text_recipe(text, fallback_title=title, platform=platform)
+    # yt-dlp often exposes the publisher as the video title. The dish name must
+    # come from cooking evidence, never an account or profile name.
+    title = recipe_title(str(info.get('title') or ''), str(caption))
+    recipe = text_recipe(str(caption), fallback_title=title, platform=platform)
+    recipe['title'] = title
+    recipe['ingredients'] = explicit_seasonings(recipe.get('ingredients') or [], [str(caption)])
     if not recipe.get('image'):
         recipe['image'] = image_url(info.get('thumbnail'), url)
     recipe['description'] = str(caption)[:350]

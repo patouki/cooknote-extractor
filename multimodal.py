@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from extractor import (ExtractionError, completion, image_url, package,
                        text_recipe, validate_public_url, STEP_VERBS, INGREDIENT_PATTERN)
+from recipe_polish import recipe_title, explicit_seasonings
 
 MAX_MEDIA = 100 * 1024 * 1024
 MAX_DURATION = 12 * 60
@@ -307,8 +308,12 @@ def merge_evidence(title: str, platform: str, fragments: list[tuple[str, str]], 
                     seen.add(normalized); dest.append(item)
     if recipe is None:
         recipe = text_recipe('', fallback_title=title, platform=platform)
-    recipe['title'] = str(title or recipe['title'])[:120]
-    recipe['ingredients'] = ingredients[:80]
+    # Social-platform video titles are frequently account names. Determine the
+    # dish from caption, transcription and OCR, or request the user's own title.
+    recipe['title'] = recipe_title(title, *(content for _, content in fragments))
+    recipe['ingredients'] = explicit_seasonings(
+        ingredients[:80], [*(content for _, content in fragments), *steps]
+    )
     recipe['steps'] = steps[:80]
     recipe['image'] = image
     method_label = ' + '.join(methods) if methods else 'Aucun média accessible'
@@ -411,7 +416,9 @@ def extract_video_url(url: str, progress=None) -> dict:
     platform = urlparse(url).hostname or 'Vidéo'
     caption = str(info.get('description') or info.get('caption') or '')[:MAX_TRANSCRIPT]
     subtitles = remote_subtitles(info)
-    fragments = [('légende', title + '\n' + caption)] if caption else []
+    # The metadata title can be the publisher. Do not inject it into the
+    # ingredient/step classifier as if it were a cooking instruction.
+    fragments = [('légende', caption)] if caption else []
     if subtitles:
         fragments.append(('sous-titres', subtitles))
     first = merge_evidence(title, platform, fragments, image=image_url(info.get('thumbnail'), url), url=url)

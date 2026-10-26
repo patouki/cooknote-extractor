@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt browser-requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt -r browser-requirements.txt
 RUN python -m playwright install ffmpeg
-COPY server.py extractor.py multimodal.py browser_capture.py ./
+COPY server.py extractor.py multimodal.py browser_capture.py recipe_polish.py ./
 COPY web/ ./web/
 RUN useradd --create-home --uid 10001 cooknote && mkdir -p /var/cache/cooknote /tmp/cooknote-runtime \
     && chown -R cooknote:cooknote /var/cache/cooknote /tmp/cooknote-runtime /app

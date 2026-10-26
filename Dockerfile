@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir -r requirements.txt
-COPY server.py extractor.py multimodal.py browser_capture.py /app/
+COPY server.py extractor.py multimodal.py browser_capture.py recipe_polish.py /app/
 COPY web/ /app/web/
 RUN useradd --create-home --uid 10001 cooknote && mkdir -p /var/cache/cooknote \
     && chown -R cooknote:cooknote /var/cache/cooknote /app
