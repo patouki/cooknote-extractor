@@ -315,6 +315,20 @@ def merge_evidence(title: str, platform: str, fragments: list[tuple[str, str]], 
     recipe['ingredients'] = explicit_seasonings(
         ingredients[:80], [*(content for _, content in fragments), *steps]
     )
+    # Explicit but unquantified fats are often displayed as their own TikTok
+    # ingredient bullet ("- Huile + beurre"). Keep both, without inventing
+    # amounts, instead of silently dropping them.
+    for source, content in fragments:
+        if source != 'légende':
+            continue
+        for line in content.splitlines():
+            candidate = line.strip().lstrip('-•*').strip()
+            if not re.fullmatch(r'(?:huile|beurre)(?:\s*\+\s*(?:huile|beurre))?', candidate, re.I):
+                continue
+            for name in candidate.split('+'):
+                name = name.strip().capitalize()
+                if not any(re.search(rf'\b{re.escape(name)}\b', known, re.I) for known in recipe['ingredients']):
+                    recipe['ingredients'].append(f'{name} (quantité à préciser)')
     recipe['steps'] = steps[:80]
     recipe['image'] = image
     method_label = ' + '.join(methods) if methods else 'Aucun média accessible'
@@ -395,12 +409,30 @@ def _download_video(url: str, destination: Path, on_progress=None):
     return file
 
 
-def extract_video_url(url: str, progress=None) -> dict:
+def extract_video_url(url: str, progress=None, checkpoint=None) -> dict:
     """Only called after public URL validation + known video platform classification."""
     import yt_dlp
-    from extractor import facebook_video_link, resolve_facebook_video_url
+    from extractor import (facebook_video_link, resolve_facebook_video_url,
+                           tiktok_video_link, resolve_tiktok_video_url,
+                           tiktok_public_caption)
     validate_public_url(url)
-    media_url = resolve_facebook_video_url(url) if facebook_video_link(url) else url
+    media_url = (resolve_facebook_video_url(url) if facebook_video_link(url)
+                 else resolve_tiktok_video_url(url) if tiktok_video_link(url) else url)
+    if media_url != url and progress:
+        progress('metadata', 7, 'Lien court résolu vers la vidéo TikTok publique…')
+    # TikTok frequently blocks yt-dlp yet still supplies public caption/recipe
+    # in its embedded page data. Read it first and checkpoint the ingredients
+    # so a failed media download cannot erase the recipe.
+    tiktok_data = tiktok_public_caption(media_url) if tiktok_video_link(url) else {}
+    public_caption = tiktok_data.get('caption') or ''
+    tiktok_partial = None
+    if public_caption:
+        tiktok_partial = merge_evidence(
+            'Recette TikTok', 'TikTok', [('légende', public_caption)],
+            image=image_url(tiktok_data.get('cover', ''), url), url=url,
+        )
+        if checkpoint:
+            checkpoint(tiktok_partial)
     if progress: progress('metadata', 9, 'Récupération des informations publiques de la vidéo…')
     opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'noplaylist': True,
             'socket_timeout': 14, 'retries': 1, 'extractor_retries': 0,
@@ -409,6 +441,11 @@ def extract_video_url(url: str, progress=None) -> dict:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(media_url, download=False)
     except Exception as exc:
+        if tiktok_partial:
+            tiktok_partial.setdefault('warnings', []).append(
+                'TikTok refuse le téléchargement audio/vidéo depuis le serveur. '
+                'Ingrédients récupérés dans la légende publique ; étapes à vérifier.')
+            return tiktok_partial
         if facebook_video_link(url):
             raise ExtractionError('Facebook ne laisse pas ce Reel se lire depuis le serveur. Ouvrez-le dans Facebook pour copier son lien direct /reel/... ou importez le fichier vidéo.', 'facebook_acces_refuse') from exc
         raise ExtractionError('Lien vidéo bloqué, privé ou non lisible publiquement. Essayez le fichier vidéo local.', 'acces_refuse') from exc
@@ -419,14 +456,19 @@ def extract_video_url(url: str, progress=None) -> dict:
     if progress: progress('metadata', 18, 'Lecture de la légende et des sous-titres…')
     title = str(info.get('title') or 'Recette vidéo')[:120]
     platform = urlparse(url).hostname or 'Vidéo'
-    caption = str(info.get('description') or info.get('caption') or '')[:MAX_TRANSCRIPT]
+    caption = (public_caption or str(info.get('description') or info.get('caption') or ''))[:MAX_TRANSCRIPT]
     subtitles = remote_subtitles(info)
     # The metadata title can be the publisher. Do not inject it into the
     # ingredient/step classifier as if it were a cooking instruction.
     fragments = [('légende', caption)] if caption else []
     if subtitles:
         fragments.append(('sous-titres', subtitles))
-    first = merge_evidence(title, platform, fragments, image=image_url(info.get('thumbnail'), url), url=url)
+    first = merge_evidence(title, platform, fragments, image=image_url(info.get('thumbnail') or tiktok_data.get('cover'), url), url=url)
+    # Metadata alone may already contain ingredients or steps. Send it back to
+    # the parent BEFORE allocating memory for Whisper / video OCR / Chromium.
+    # If an OOM killer terminates the worker, this checkpoint can be recovered.
+    if checkpoint:
+        checkpoint(first)
     if first['status'] == 'complete':
         return first
     # If ingredients/steps are missing, retrieve public media for transcription + OCR.

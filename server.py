@@ -282,7 +282,7 @@ def _isolated_job_work(job_id: str, url: str):
     # killed; unlike ThreadPoolExecutor itself, this is forcibly cancellable.
     _job_update(job_id, 'running', 'metadata', 5, 'Lecture des informations publiques…')
     proc = None
-    result_holder = {'result': None, 'error': None}
+    result_holder = {'result': None, 'error': None, 'checkpoint': None}
     try:
         with processing_slot():
             with _jobs_lock:
@@ -308,6 +308,10 @@ def _isolated_job_work(job_id: str, url: str):
                     if event.get('type') == 'progress':
                         _job_update(job_id, 'running', event.get('phase', 'metadata'),
                                     event.get('percent', 8), event.get('message', 'Traitement en cours…'))
+                    elif event.get('type') == 'checkpoint':
+                        partial = event.get('result')
+                        if isinstance(partial, dict):
+                            result_holder['checkpoint'] = partial
                     elif event.get('type') == 'result':
                         result_holder['result'] = event.get('result')
                     elif event.get('type') == 'error':
@@ -334,10 +338,30 @@ def _isolated_job_work(job_id: str, url: str):
             _job_update(job_id, 'completed', 'finished', 100, 'Recette analysée.',
                         result=result_holder['result'])
         else:
-            err = result_holder['error'] or {'code': 'worker_failed',
-                 'message': 'Le moteur a été interrompu. Réessayez ou importez le fichier vidéo.'}
-            _job_update(job_id, 'failed', 'failed', 100, str(err['message']),
-                        error={'code':str(err.get('code') or 'worker_failed'), 'message':str(err['message'])})
+            partial = result_holder['checkpoint']
+            recipe = partial.get('recipe') if isinstance(partial, dict) else None
+            has_evidence = bool(isinstance(recipe, dict) and
+                                ((recipe.get('ingredients') or []) or (recipe.get('steps') or [])))
+            if has_evidence:
+                # Recover a real caption/subtitle recipe even if the expensive
+                # audio/video worker was terminated after metadata extraction.
+                partial.setdefault('warnings', []).append(
+                    'L’analyse audio/vidéo a été interrompue. La légende et les sous-titres ont été conservés.')
+                partial['status'] = 'partial'
+                _job_update(job_id, 'completed', 'finished', 100,
+                            'Recette partielle récupérée : éléments à vérifier.', result=partial)
+            else:
+                exit_code = proc.returncode if proc else None
+                killed = exit_code in (-signal.SIGKILL, 137)
+                err = result_holder['error'] or {
+                    'code': 'worker_memory' if killed else 'worker_failed',
+                    'message': ('Le traitement vidéo a été arrêté par le serveur, probablement par manque de mémoire. '
+                                'Essayez de nouveau ou importez le fichier vidéo.'
+                                if killed else
+                                'La vidéo n’a pas pu être traitée sur ce serveur. Réessayez ou importez le fichier vidéo.'),
+                }
+                _job_update(job_id, 'failed', 'failed', 100, str(err['message']),
+                            error={'code':str(err.get('code') or 'worker_failed'), 'message':str(err['message'])})
     except Exception:
         _job_update(job_id, 'failed', 'failed', 100,
                     'Impossible de lancer le moteur vidéo. Réessayez.',

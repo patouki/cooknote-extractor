@@ -11,12 +11,30 @@ import sys
 PREFIX = 'COOKNOTE_JOB_JSON:'
 
 
+def low_memory_instance() -> bool:
+    """Use a lighter TikTok path on 512 MB Render instances.
+
+    Starting Chromium after a rejected media download can push the process
+    above its cgroup limit and kill the entire job before it can report errors.
+    """
+    from pathlib import Path
+    try:
+        raw = Path('/sys/fs/cgroup/memory.max').read_text().strip()
+        if raw.isdecimal():
+            return int(raw) <= 768 * 1024 * 1024
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def send(kind: str, **fields):
     print(PREFIX + json.dumps({'type': kind, **fields}, ensure_ascii=False, default=str), flush=True)
 
 
 def extract_video(url: str):
-    from extractor import ExtractionError, extract_url, is_social, validate_public_url, facebook_video_link, resolve_facebook_video_url
+    from extractor import (ExtractionError, extract_url, is_social, validate_public_url,
+                           facebook_video_link, resolve_facebook_video_url,
+                           tiktok_video_link, resolve_tiktok_video_url)
     from multimodal import extract_video_url
     import browser_capture
 
@@ -29,7 +47,9 @@ def extract_video(url: str):
     first_error = None
     video = is_social(url)
     try:
-        output = extract_video_url(url, progress=progress) if video else extract_url(url)
+        output = (extract_video_url(url, progress=progress,
+                  checkpoint=lambda item: send('checkpoint', result=item))
+                  if video else extract_url(url))
     except ExtractionError as exc:
         first_error = exc
     except Exception:
@@ -42,9 +62,14 @@ def extract_video(url: str):
     # Do not open Chromium after a full local download has already been
     # transcribed or OCR'd. On a 512 MB server, Whisper/RapidOCR + Chromium
     # in one process can trigger the OOM killer and discard the usable result.
-    if video and browser_enabled and not media_evidence:
+    # On low-RAM instances, Chromium + video decoders can be OOM-killed when
+    # TikTok denies its public MP4. Prefer the existing caption/subtitle output
+    # and a clear import error over a killed worker and lost progress.
+    heavy_tiktok_fallback = tiktok_video_link(url) and low_memory_instance()
+    if video and browser_enabled and not media_evidence and not heavy_tiktok_fallback:
         try:
-            capture_url = resolve_facebook_video_url(url) if facebook_video_link(url) else url
+            capture_url = (resolve_facebook_video_url(url) if facebook_video_link(url)
+                           else resolve_tiktok_video_url(url) if tiktok_video_link(url) else url)
             captured = browser_capture.capture_public_video(capture_url, progress=progress)
             if facebook_video_link(url) and isinstance(captured, dict):
                 captured['sourceUrl'] = url
@@ -60,12 +85,16 @@ def extract_video(url: str):
                 raise ExtractionError('Facebook empêche la lecture de ce Reel depuis le navigateur cloud. Essayez un lien direct /reel/<identifiant> ou importez le fichier vidéo.', 'facebook_acces_refuse') from exc
             raise
     if output:
+        if heavy_tiktok_fallback and output.get('status') == 'none':
+            output.setdefault('warnings', []).append('La lecture de TikTok est limitée sur ce serveur. Réessayez avec la vidéo enregistrée.')
         if video and not browser_enabled:
             output.setdefault('warnings', []).append('Capture navigateur non disponible.')
         elif video and media_evidence and output.get('status') != 'complete':
             output.setdefault('warnings', []).append('Audio et images analysés. Complétez les éléments manquants avant la sauvegarde.')
         return output
     if first_error:
+        if heavy_tiktok_fallback:
+            raise ExtractionError('TikTok limite l’accès à cette vidéo depuis le serveur. Importez le fichier vidéo pour analyser son audio et ses images.', 'tiktok_acces_refuse') from first_error
         raise first_error
     raise ExtractionError('Aucune recette détectée.', 'source_indisponible')
 

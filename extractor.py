@@ -63,6 +63,112 @@ def is_social(url: str) -> bool:
     return any(host == root or host.endswith('.' + root) for root in SOCIAL_DOMAINS)
 
 
+def tiktok_video_link(url: str) -> bool:
+    host = (urlparse(url).hostname or '').strip('.').lower()
+    return host in ('vm.tiktok.com', 'vt.tiktok.com', 'www.tiktok.com', 'tiktok.com',
+                    'm.tiktok.com')
+
+
+def resolve_tiktok_video_url(url: str) -> str:
+    """Resolve official TikTok share redirects safely to a canonical public video.
+
+    vm.tiktok.com is a redirect stub without the video ID; yt-dlp and Chromium
+    can otherwise encounter different interstitials and download failures.
+    Never follow a redirect to a different domain or to internal addresses.
+    """
+    if not tiktok_video_link(url):
+        return url
+    original = validate_public_url(url)
+    parsed = urlparse(original)
+    if parsed.hostname not in ('vm.tiktok.com', 'vt.tiktok.com'):
+        return original
+    current = original
+    try:
+        with requests.Session() as session:
+            for _ in range(4):
+                validate_public_url(current)
+                with session.get(
+                    current, allow_redirects=False, stream=True, timeout=(4, 9),
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36',
+                        'Accept-Language': 'fr-FR,fr;q=0.9',
+                    },
+                ) as response:
+                    if response.status_code not in (301, 302, 303, 307, 308):
+                        break
+                    candidate = urljoin(current, response.headers.get('Location') or '')
+                    candidate_host = (urlparse(candidate).hostname or '').strip('.').lower()
+                    if candidate_host not in ('vm.tiktok.com', 'vt.tiktok.com',
+                                              'tiktok.com', 'www.tiktok.com',
+                                              'm.tiktok.com'):
+                        return original
+                    candidate = validate_public_url(candidate)
+                    path = urlparse(candidate).path
+                    if re.fullmatch(r'/@[^/]{1,70}/video/\d{8,25}/?', path):
+                        # Strip unneeded tracking arguments: canonical ID is stable.
+                        u = urlparse(candidate)
+                        return f'https://www.tiktok.com{u.path.rstrip("/")}'
+                    current = candidate
+    except (requests.RequestException, ExtractionError, ValueError):
+        pass
+    return original
+
+
+def tiktok_public_caption(canonical_url: str) -> dict:
+    """Read only the public TikTok video's embedded description.
+
+    This is not a media downloader and does not authenticate, solve CAPTCHAs,
+    or visit arbitrary hosts. Return nothing for unavailable/private videos.
+    """
+    parsed = urlparse(canonical_url)
+    match = re.fullmatch(r'/@[^/]{1,70}/video/(\d{8,25})/?', parsed.path)
+    if parsed.scheme != 'https' or parsed.hostname not in ('tiktok.com', 'www.tiktok.com') or not match:
+        return {}
+    validate_public_url(canonical_url)
+    clean_url = f'https://www.tiktok.com{parsed.path.rstrip("/")}'
+    try:
+        with requests.Session() as session:
+            with session.get(
+                clean_url, allow_redirects=False, stream=True, timeout=(5, 12),
+                headers={'User-Agent': 'Mozilla/5.0',
+                         'Accept-Language': 'fr-FR,fr;q=0.9'},
+            ) as response:
+                if response.status_code != 200 or 'html' not in response.headers.get('Content-Type', '').lower():
+                    return {}
+                pieces, total = [], 0
+                for chunk in response.iter_content(chunk_size=32768):
+                    total += len(chunk)
+                    if total > 1_500_000:
+                        return {}
+                    pieces.append(chunk)
+                markup = b''.join(pieces).decode('utf-8', errors='replace')
+        soup = BeautifulSoup(markup, 'html.parser')
+        script = soup.find('script', id='__UNIVERSAL_DATA_FOR_REHYDRATION__')
+        if script is None:
+            return {}
+        data = json.loads(script.string or script.get_text() or '{}')
+        scope = data.get('__DEFAULT_SCOPE__') or {}
+        public = scope.get('webapp.video-detail') or {}
+        if public.get('statusCode') not in (0, '0'):
+            return {}
+        item = (public.get('itemInfo') or {}).get('itemStruct') or {}
+        if str(item.get('id') or '') != match.group(1):
+            return {}
+        caption = str(item.get('desc') or '')[:12_000].strip()
+        if not caption:
+            return {}
+        # Captions often put ingredient lines on a single paragraph separated
+        # by a hyphen. Preserve the public quantities and separate each line
+        # for the same recipe parser used by captions and transcripts.
+        caption = re.sub(r'\s+[-–]\s+(?=\S)', '\n- ', caption)
+        cover = (item.get('video') or {}).get('cover') or ''
+        duration = (item.get('video') or {}).get('duration') or 0
+        return {'caption': caption, 'cover': str(cover)[:2500],
+                'duration': duration, 'id': match.group(1)}
+    except (requests.RequestException, ExtractionError, ValueError, TypeError, AttributeError):
+        return {}
+
+
 def facebook_video_link(url: str) -> bool:
     """Only recognize Facebook share, reel and video URLs on exact official hosts."""
     host = (urlparse(url).hostname or '').strip('.').lower()
