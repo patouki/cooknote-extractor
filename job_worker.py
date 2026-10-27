@@ -38,7 +38,7 @@ def extract_video(url: str):
     if output and output.get('status') == 'complete':
         return output
     browser_enabled = browser_capture.browser_available()
-    media_evidence = bool(output and set(output.get('evidence') or ()).intersection({'audio Whisper', 'images OCR'}))
+    media_evidence = bool(output and ('durationSeconds' in output or set(output.get('evidence') or ()).intersection({'audio Whisper', 'images OCR'})))
     # Do not open Chromium after a full local download has already been
     # transcribed or OCR'd. On a 512 MB server, Whisper/RapidOCR + Chromium
     # in one process can trigger the OOM killer and discard the usable result.

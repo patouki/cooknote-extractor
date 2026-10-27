@@ -26,6 +26,15 @@ def test_downloaded_media_result_does_not_spawn_chromium(monkeypatch, status, ev
     assert called['browser']==0
     assert any('Complétez' in warning for warning in produced['warnings'])
 
+def test_downloaded_but_no_recognizable_audio_or_ocr_skips_browser(monkeypatch):
+    monkeypatch.setattr(extractor,'validate_public_url',lambda url:url)
+    monkeypatch.setattr(browser_capture,'browser_available',lambda:True)
+    monkeypatch.setattr(browser_capture,'capture_public_video',lambda url,progress=None:(_ for _ in ()).throw(AssertionError('Do not spawn Chromium after full media processing')))
+    media={'status':'none','evidence':[],'durationSeconds':42,'recipe':{'title':'Recette à nommer','ingredients':[],'steps':[]},'warnings':[]}
+    monkeypatch.setattr(multimodal,'extract_video_url',lambda url,progress=None:media)
+    assert job_worker.extract_video('https://www.facebook.com/share/r/1LuJhpW783/') is media
+
+
 def test_browser_fallback_still_attempted_when_metadata_only(monkeypatch):
     monkeypatch.setattr(extractor,'validate_public_url',lambda url:url)
     monkeypatch.setattr(browser_capture,'browser_available',lambda:True)

@@ -388,7 +388,7 @@ def _job_work(job_id: str, url: str):
                 first_error = ExtractionError('Source indisponible pour le téléchargeur.', 'acces_refuse')
             if output and output.get('status') == 'complete':
                 result = output
-            elif is_video and browser_capture.browser_available() and not (output and set(output.get('evidence') or ()).intersection({'audio Whisper', 'images OCR'})):
+            elif is_video and browser_capture.browser_available() and not (output and ('durationSeconds' in output or set(output.get('evidence') or ()).intersection({'audio Whisper', 'images OCR'}))):
                 def progress(phase, pct, text):
                     _job_update(job_id, 'running', phase, pct, text)
                 try:
