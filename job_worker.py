@@ -16,7 +16,7 @@ def send(kind: str, **fields):
 
 
 def extract_video(url: str):
-    from extractor import ExtractionError, extract_url, is_social, validate_public_url
+    from extractor import ExtractionError, extract_url, is_social, validate_public_url, facebook_video_link, resolve_facebook_video_url
     from multimodal import extract_video_url
     import browser_capture
 
@@ -39,7 +39,10 @@ def extract_video(url: str):
         return output
     if video and browser_capture.browser_available():
         try:
-            captured = browser_capture.capture_public_video(url, progress=progress)
+            capture_url = resolve_facebook_video_url(url) if facebook_video_link(url) else url
+            captured = browser_capture.capture_public_video(capture_url, progress=progress)
+            if facebook_video_link(url) and isinstance(captured, dict):
+                captured['sourceUrl'] = url
             if output and output.get('status') != 'none' and captured.get('status') == 'none':
                 output.setdefault('warnings', []).append('Navigateur : aucun nouvel ingrédient fiable détecté.')
                 return output
@@ -48,6 +51,8 @@ def extract_video(url: str):
             if output:
                 output.setdefault('warnings', []).append(str(exc))
                 return output
+            if facebook_video_link(url):
+                raise ExtractionError('Facebook empêche la lecture de ce Reel depuis le navigateur cloud. Essayez un lien direct /reel/<identifiant> ou importez le fichier vidéo.', 'facebook_acces_refuse') from exc
             raise
     if output:
         if video:

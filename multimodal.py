@@ -397,15 +397,19 @@ def _download_video(url: str, destination: Path, on_progress=None):
 def extract_video_url(url: str, progress=None) -> dict:
     """Only called after public URL validation + known video platform classification."""
     import yt_dlp
+    from extractor import facebook_video_link, resolve_facebook_video_url
     validate_public_url(url)
+    media_url = resolve_facebook_video_url(url) if facebook_video_link(url) else url
     if progress: progress('metadata', 9, 'Récupération des informations publiques de la vidéo…')
     opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'noplaylist': True,
             'socket_timeout': 14, 'retries': 1, 'extractor_retries': 0,
             'ignoreerrors': False, 'cachedir': False, 'playlistend': 1}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(media_url, download=False)
     except Exception as exc:
+        if facebook_video_link(url):
+            raise ExtractionError('Facebook ne laisse pas ce Reel se lire depuis le serveur. Ouvrez-le dans Facebook pour copier son lien direct /reel/... ou importez le fichier vidéo.', 'facebook_acces_refuse') from exc
         raise ExtractionError('Lien vidéo bloqué, privé ou non lisible publiquement. Essayez le fichier vidéo local.', 'acces_refuse') from exc
     if not isinstance(info, dict):
         raise ExtractionError('Métadonnées vidéo absentes.', 'source_indisponible')
@@ -437,7 +441,7 @@ def extract_video_url(url: str, progress=None) -> dict:
     if progress: progress('downloading', 28, 'Préparation du téléchargement de la vidéo…')
     with tempfile.TemporaryDirectory(prefix='cooknote-video-') as temp:
         try:
-            path = _download_video(url, Path(temp), on_progress=progress)
+            path = _download_video(media_url, Path(temp), on_progress=progress)
         except ExtractionError as exc:
             first['warnings'] = [str(exc)]
             first['message'] += ' ' + str(exc)

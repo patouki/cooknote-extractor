@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from recipe_polish import recipe_title, explicit_seasonings
 
 MAX_HTML = 3_000_000
-SOCIAL_DOMAINS = ('tiktok.com', 'instagram.com', 'youtube.com', 'youtu.be')
+SOCIAL_DOMAINS = ('tiktok.com', 'instagram.com', 'youtube.com', 'youtu.be', 'facebook.com', 'fb.watch')
 USER_AGENT = 'Mozilla/5.0 (compatible; CooknoteRecipeImporter/3.0; +http://localhost)'
 MEASURE = r'(?:kg|g|gr|grammes?|ml|cl|dl|l|litres?|c\.?\s*à\s*(?:soupe|café)|cuill[eè]res?\s*à\s*(?:soupe|caf[eé])|tasses?|pinc[eé]es?|gousses?|tranches?|bo[iî]tes?|sachets?|verres?|cs|cc)'
 QTY = r'(?:\d+(?:[.,/]\d+)?|[½¼¾⅓⅔])'
@@ -61,6 +61,70 @@ def validate_public_url(value: str) -> str:
 def is_social(url: str) -> bool:
     host = urlparse(url).hostname or ''
     return any(host == root or host.endswith('.' + root) for root in SOCIAL_DOMAINS)
+
+
+def facebook_video_link(url: str) -> bool:
+    """Only recognize Facebook share, reel and video URLs on exact official hosts."""
+    host = (urlparse(url).hostname or '').strip('.').lower()
+    return host == 'fb.watch' or host == 'facebook.com' or host.endswith('.facebook.com')
+
+
+def resolve_facebook_video_url(url: str) -> str:
+    """Resolve an accessible Facebook share redirect or canonical og:url.
+
+    Facebook sometimes returns HTTP 400 or a login wall to cloud IPs.
+    If it does, preserve the original URL for the downstream extractor/browser.
+    Never follow a redirect outside official Facebook hosts or to private IPs.
+    """
+    if not facebook_video_link(url):
+        return url
+    parsed = urlparse(url)
+    # Direct /reel/... and /watch URLs are already canonical. Avoid fetching them twice.
+    if parsed.hostname != 'fb.watch' and not parsed.path.startswith('/share/'):
+        return url
+    current = validate_public_url(url)
+    try:
+        with requests.Session() as session:
+            for _ in range(4):
+                parsed = urlparse(current)
+                if not facebook_video_link(current):
+                    return url
+                validate_public_url(current)
+                with session.get(current, allow_redirects=False, stream=True,
+                                 timeout=(4, 8),
+                                 headers={'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36',
+                                          'Accept': 'text/html,application/xhtml+xml',
+                                          'Accept-Language': 'fr-FR,fr;q=0.9'}) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        from urllib.parse import urljoin
+                        next_url = urljoin(current, response.headers.get('Location') or '')
+                        if not facebook_video_link(next_url):
+                            return url
+                        current = validate_public_url(next_url)
+                        continue
+                    if response.status_code != 200:
+                        return url
+                    # Only inspect a small public HTML header, not arbitrary media.
+                    if 'html' not in response.headers.get('Content-Type', '').lower():
+                        return current
+                    html_parts = []
+                    total = 0
+                    for chunk in response.iter_content(chunk_size=16384):
+                        total += len(chunk)
+                        if total > 200_000:
+                            break
+                        html_parts.append(chunk)
+                    snippet = b''.join(html_parts).decode('utf-8', errors='replace')
+                    from bs4 import BeautifulSoup
+                    doc = BeautifulSoup(snippet, 'html.parser')
+                    for tag in doc.find_all('meta', attrs={'property': 'og:url'}):
+                        canonical = tag.get('content', '')
+                        if canonical and facebook_video_link(canonical):
+                            return validate_public_url(canonical)
+                    return current
+    except (requests.RequestException, ExtractionError, ValueError, OSError):
+        return url
+    return url
 
 
 def get_public_html(url: str, *, session=None) -> tuple[str, str]:

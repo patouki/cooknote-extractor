@@ -160,6 +160,14 @@ def supported_video_url(url: str):
         return False
     if host == 'instagram.com':
         return bool(re.fullmatch(r'/(?:reel|p|tv)/[A-Za-z0-9_-]{5,40}/?', path))
+    if host == 'fb.watch':
+        return bool(re.fullmatch(r'/[A-Za-z0-9_-]{5,60}/?', path))
+    if host == 'facebook.com':
+        return bool(re.fullmatch(r'/share/(?:r|v|p)/[A-Za-z0-9_-]{5,60}/?', path)
+                    or re.fullmatch(r'/reels?/\d{5,30}/?', path)
+                    or re.fullmatch(r'/(?:videos/)?\d{5,30}/?', path)
+                    or re.fullmatch(r'/(?:[^/]{1,90}/)?videos/(?:[^/]{1,100}/)?\d{5,30}/?', path)
+                    or (path == '/watch/' or path == '/watch') and bool(re.fullmatch(r'\d{5,30}', parse_qs(parsed.query).get('v',[''])[0])))
     if host == 'tiktok.com':
         return bool(re.fullmatch(r'/@[^/]{1,70}/video/\d{8,25}/?', path))
     if host == 'vm.tiktok.com' or host == 'vt.tiktok.com':
@@ -177,7 +185,7 @@ def extract_checked(url: str, progress=None):
     validate_public_url(url)
     if is_social(url):
         if not supported_video_url(url):
-            raise ExtractionError('Lien vidéo non pris en charge : utilisez un Reel, un TikTok ou une vidéo YouTube.', 'url_invalide')
+            raise ExtractionError('Lien vidéo non pris en charge : utilisez un Reel Facebook ou Instagram, un TikTok ou une vidéo YouTube.', 'url_invalide')
         return extract_video_url(url, progress=progress) if progress else extract_video_url(url)
     return extract_url(url)
 
