@@ -37,7 +37,12 @@ def extract_video(url: str):
 
     if output and output.get('status') == 'complete':
         return output
-    if video and browser_capture.browser_available():
+    browser_enabled = browser_capture.browser_available()
+    media_evidence = bool(output and set(output.get('evidence') or ()).intersection({'audio Whisper', 'images OCR'}))
+    # Do not open Chromium after a full local download has already been
+    # transcribed or OCR'd. On a 512 MB server, Whisper/RapidOCR + Chromium
+    # in one process can trigger the OOM killer and discard the usable result.
+    if video and browser_enabled and not media_evidence:
         try:
             capture_url = resolve_facebook_video_url(url) if facebook_video_link(url) else url
             captured = browser_capture.capture_public_video(capture_url, progress=progress)
@@ -55,8 +60,10 @@ def extract_video(url: str):
                 raise ExtractionError('Facebook empêche la lecture de ce Reel depuis le navigateur cloud. Essayez un lien direct /reel/<identifiant> ou importez le fichier vidéo.', 'facebook_acces_refuse') from exc
             raise
     if output:
-        if video:
+        if video and not browser_enabled:
             output.setdefault('warnings', []).append('Capture navigateur non disponible.')
+        elif video and media_evidence and output.get('status') != 'complete':
+            output.setdefault('warnings', []).append('Audio et images analysés. Complétez les éléments manquants avant la sauvegarde.')
         return output
     if first_error:
         raise first_error
