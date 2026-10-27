@@ -85,6 +85,10 @@ def _title_candidate(value: str) -> str:
             break
     if re.match(r'(?i)^(?:ajoutez?|m[eé]langez?|coupez?|versez?|cuisez?|assaisonnez?|salez|poivrez|pr[eé]chauffez|incorporez?|servez?|ensuite|puis)\b', value):
         return ''
+    # Spoken instructions are not dish names, even when they mention poulet, riz, etc.
+    # Example: « Je vais ajouter 600g de blanc de poulet » must not become the title.
+    if re.match(r"(?i)^(?:(?:alors|ensuite|donc)\s+)?(?:j[’']|je\s+|on\s+|nous\s+|vous\s+)(?:(?:vais|va|allons|allez)\s+)?(?:ajout\w*|mett\w*|m[eé]lang\w*|vers\w*|coup\w*|cuir\w*|cuis\w*|assaisonn\w*|d[eé]pos\w*|incorpor\w*|saupoudr\w*)\b", value):
+        return ''
     if not value or len(value) < 5:
         return ''
     if PROMO_RE.search(value) or not DISH_RE.search(value):

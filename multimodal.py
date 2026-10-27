@@ -263,7 +263,8 @@ def speech_to_recipe(text: str, *, title: str, platform: str) -> dict:
                 ingredients.append(candidate)
         # Detect actual action phrases. Avoid treating promotional sentences as steps.
         clause = re.sub(r'^(?:alors|donc|on va|vous allez|il faut|pour commencer|maintenant)\s+', '', piece, flags=re.I)
-        if (STEP_VERBS.match(clause) or re.match(r'^(?:mélangez|ajoutez|coupez|versez|faites|préchauffez|cuisez|laissez|servez|incorporez|mettez|fouettez|battez|mixez|retirez|égouttez|émincez|épluchez|réservez|on\s+(?:mélange|ajoute|coupe|fait|met|verse))\b', clause, re.I)) and len(clause) >= 12 and clause.casefold() not in {s.casefold() for s in steps}:
+        narrated_action = re.match(r"^(?:j[’']|je\s+|on\s+|nous\s+|vous\s+)(?:(?:vais|va|allons|allez)\s+)?(?:ajout\w*|mett\w*|m[eé]lang\w*|vers\w*|coup\w*|cuis\w*|assaisonn\w*|d[eé]pos\w*|incorpor\w*|saupoudr\w*)\b", clause, re.I)
+        if (STEP_VERBS.match(clause) or narrated_action or re.match(r'^(?:mélangez|ajoutez|coupez|versez|faites|préchauffez|cuisez|laissez|servez|incorporez|mettez|fouettez|battez|mixez|retirez|égouttez|émincez|épluchez|réservez|on\s+(?:mélange|ajoute|coupe|fait|met|verse))\b', clause, re.I)) and len(clause) >= 12 and clause.casefold() not in {s.casefold() for s in steps}:
             steps.append(clause[:420])
     base['ingredients'] = ingredients[:80]
     base['steps'] = steps[:80]
