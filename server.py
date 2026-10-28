@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from extractor import ExtractionError, extract_url, is_social, validate_public_url, package
+from extractor import ExtractionError, extract_url, is_social, validate_public_url, url_content_kind, package
 from multimodal import binaries, extract_video_url, ocr_image, process_media_file, visual_to_recipe, MAX_MEDIA
 
 ROOT = Path(__file__).resolve().parent
@@ -183,9 +183,11 @@ def supported_video_url(url: str):
 def extract_checked(url: str, progress=None):
     # Validate URL and ensure public resolution before any external requests.
     validate_public_url(url)
-    if is_social(url):
+    kind=url_content_kind(url)
+    if kind=='social-video':
         if not supported_video_url(url):
             raise ExtractionError('Lien vidéo non pris en charge : utilisez un Reel Facebook ou Instagram, un TikTok ou une vidéo YouTube.', 'url_invalide')
+    if kind in ('social-video','direct-media'):
         return extract_video_url(url, progress=progress) if progress else extract_video_url(url)
     return extract_url(url)
 
@@ -240,7 +242,7 @@ def _job_public(job: dict):
     with _jobs_lock:
         _expire_queued_locked(job)
         data = {k: v for k, v in job.items() if k in
-                ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error')}
+                ('jobId', 'state', 'phase', 'percent', 'message', 'createdAt', 'updatedAt', 'result', 'error', 'sourceKind')}
         running, waiting = _queue_totals_locked()
         data['queueLength'] = waiting + running
         data['waitingCount'] = waiting
@@ -474,6 +476,7 @@ def start_job(req: ExtractRequest):
                                 headers={'Retry-After': '30'})
         job_id = uuid.uuid4().hex
         job = {'jobId': job_id, 'state': 'queued', 'phase': 'queued', 'percent': 0,
+               'sourceKind': url_content_kind(req.url),
                'message': 'En file d’attente : extraction dès que le moteur est libre.',
                'createdAt': now, 'updatedAt': now, 'result': None, 'error': None,
                '_url': req.url}

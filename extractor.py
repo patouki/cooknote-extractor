@@ -252,16 +252,19 @@ def get_public_html(url: str, *, session=None) -> tuple[str, str]:
                 if response.status_code >= 400:
                     raise ExtractionError(f'Le site répond avec une erreur HTTP {response.status_code}.')
                 ctype = response.headers.get('Content-Type', '').lower()
-                if 'text/html' not in ctype and 'application/xhtml' not in ctype:
-                    raise ExtractionError('Ce lien ne renvoie pas une page HTML.')
+                if not any(kind in ctype for kind in ('text/html','application/xhtml','text/plain','text/markdown')):
+                    raise ExtractionError('Ce lien ne contient pas de page web ou de texte lisible. Pour une vidéo directe, utilisez une URL MP4/WebM ou importez le fichier.', 'type_non_pris_en_charge')
                 chunks, size = [], 0
                 for chunk in response.iter_content(chunk_size=65536):
                     size += len(chunk)
                     if size > MAX_HTML:
                         raise ExtractionError('Page trop volumineuse pour l’analyse.', 'limite')
                     chunks.append(chunk)
-                response.encoding = response.apparent_encoding or 'utf-8'
-                return b''.join(chunks).decode(response.encoding, errors='replace'), current
+                # A streaming response has already been consumed by iter_content.
+                # response.apparent_encoding reads response.content again and raises
+                # RuntimeError: The content for this response was already consumed.
+                encoding = response.encoding or 'utf-8'
+                return b''.join(chunks).decode(encoding, errors='replace'), current
         except requests.RequestException as err:
             raise ExtractionError(f'Connexion au site impossible : {type(err).__name__}.') from err
     raise ExtractionError('Trop de redirections.', 'limite')
@@ -437,6 +440,19 @@ def package(recipe: dict, method: str, url: str = '', note: str = '') -> dict:
 def from_structured(data: dict, url: str, fallback_title='') -> dict:
     raw_ingredients = data.get('recipeIngredient', [])
     ingredients = list_of_text(raw_ingredients)
+    # Delhaize's JSON-LD reverses quantities ("de farine 25 g").
+    # Restore readable quantity-first lines without adding any new ingredient.
+    if (urlparse(url).hostname or '').lower().endswith('delhaize.be'):
+        revised = []
+        qty_re = re.compile(r"^(.+?)\s+(\d+(?:[.,]\d+)?)\s*(kg|g|ml|cl|dl|l|c\s*à\s*s|c\s*à\s*c|(?:petite|grande)\s+gousses?)?\s*$", re.I)
+        for ingredient in ingredients:
+            found = qty_re.fullmatch(ingredient.strip())
+            if found and not re.match(r'^\d', found[1]):
+                quantity,unit=found[2],found[3]
+                revised.append(f"{quantity} {unit+' ' if unit else ''}{found[1]}".strip())
+            else:
+                revised.append(ingredient)
+        ingredients = revised
     steps = flatten_steps(data.get('recipeInstructions'))
     nutrition = data.get('nutrition') or {}
     if not isinstance(nutrition, dict):
@@ -530,10 +546,50 @@ def extract_social(url: str) -> dict:
     return result
 
 
+
+DIRECT_MEDIA_EXTENSIONS=frozenset({'.mp4','.m4v','.mov','.webm','.mkv','.mp3','.m4a','.aac','.wav','.ogg','.flac'})
+DIRECT_TEXT_EXTENSIONS=frozenset({'.txt','.md','.markdown','.csv','.text'})
+DIRECT_JSON_EXTENSIONS=frozenset({'.json','.jsonld'})
+
+def url_content_kind(url: str) -> str:
+    """Cheap, deterministic routing before any untrusted HTTP request."""
+    parsed=urlparse(url)
+    if is_social(url):
+        return 'social-video'
+    from pathlib import PurePosixPath
+    extension=PurePosixPath(parsed.path.lower()).suffix
+    if extension in DIRECT_MEDIA_EXTENSIONS:
+        return 'direct-media'
+    if extension in DIRECT_TEXT_EXTENSIONS:
+        return 'text'
+    if extension in DIRECT_JSON_EXTENSIONS:
+        return 'json'
+    return 'webpage'
+
+def extract_text_document(url: str, kind: str = 'text') -> dict:
+    raw=get_public_text(url, max_bytes=350_000)
+    if kind == 'json':
+        try:
+            document=json.loads(raw)
+        except (ValueError,TypeError) as exc:
+            raise ExtractionError('Ce document JSON ne contient pas de données valides.','texte_invalide') from exc
+        obj=find_recipe_object(document)
+        if obj:
+            return package(from_structured(obj,url), 'JSON-LD de recette', url)
+        raw=json.dumps(document,ensure_ascii=False,indent=2)[:60_000]
+    title=urlparse(url).path.rsplit('/',1)[-1].rsplit('.',1)[0].replace('-', ' ').replace('_',' ').strip()
+    recipe=text_recipe(raw[:60_000], fallback_title=title or 'Recette à compléter', platform=urlparse(url).hostname or 'texte')
+    return package(recipe,'Texte public du lien',url)
+
 def extract_url(url: str) -> dict:
     url = validate_public_url(url)
-    if is_social(url):
+    kind = url_content_kind(url)
+    if kind == 'social-video':
         return extract_social(url)
+    if kind in ('text', 'json'):
+        return extract_text_document(url, kind)
+    if kind == 'direct-media':
+        raise ExtractionError('Ce lien est un média : il doit être analysé avec le moteur audio/vidéo.', 'media_detecte')
     html, final_url = get_public_html(url)
     return extract_html(html, final_url)
 

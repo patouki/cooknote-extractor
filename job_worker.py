@@ -33,7 +33,7 @@ def send(kind: str, **fields):
 
 def extract_video(url: str):
     from extractor import (ExtractionError, extract_url, is_social, validate_public_url,
-                           facebook_video_link, resolve_facebook_video_url,
+                           url_content_kind, facebook_video_link, resolve_facebook_video_url,
                            tiktok_video_link, resolve_tiktok_video_url)
     from multimodal import extract_video_url
     import browser_capture
@@ -45,7 +45,11 @@ def extract_video(url: str):
 
     output = None
     first_error = None
-    video = is_social(url)
+    content_kind = url_content_kind(url)
+    progress('metadata',10, 'Analyse de la page web et de ses données de recette…' if content_kind=='webpage' else
+             'Lecture de votre document texte…' if content_kind in ('text','json') else
+             'Analyse audio et visuelle du média…')
+    video = content_kind in ('social-video','direct-media')
     try:
         output = (extract_video_url(url, progress=progress,
                   checkpoint=lambda item: send('checkpoint', result=item))
@@ -66,7 +70,7 @@ def extract_video(url: str):
     # TikTok denies its public MP4. Prefer the existing caption/subtitle output
     # and a clear import error over a killed worker and lost progress.
     heavy_tiktok_fallback = tiktok_video_link(url) and low_memory_instance()
-    if video and browser_enabled and not media_evidence and not heavy_tiktok_fallback:
+    if content_kind == 'social-video' and browser_enabled and not media_evidence and not heavy_tiktok_fallback:
         try:
             capture_url = (resolve_facebook_video_url(url) if facebook_video_link(url)
                            else resolve_tiktok_video_url(url) if tiktok_video_link(url) else url)
